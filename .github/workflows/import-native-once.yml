@@ -1,0 +1,315 @@
+name: Import verified Arabic Grammar native source
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/import-native-once.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    defaults:
+      run:
+        working-directory: legacy
+    steps:
+      - name: Checkout new Arabic Grammar repository
+        uses: actions/checkout@v4
+        with:
+          path: target
+
+      - name: Checkout pinned original reconstruction and fixes
+        uses: actions/checkout@v4
+        with:
+          repository: Xalidmuslim/AlFatiha-Native
+          ref: d99928a821ff980daebdd92bff7fbe2969002e2c
+          path: legacy
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Reconstruct exact source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/ag
+          cat ag-source-parts/part_*.b64 | base64 -d > /tmp/ag/source.zip
+          echo "a207e6f3156c9b62e03566991fcf51f11883db07ab7fecf1c38253a4ab82a160  /tmp/ag/source.zip" | sha256sum -c -
+          unzip -t /tmp/ag/source.zip
+          mkdir -p /tmp/ag/project
+          unzip -q /tmp/ag/source.zip -d /tmp/ag/project
+          echo "e13bf794cd58226b78e206b6f050cad9cd051de0b22ceebb45ed04075cf4bce5  /tmp/ag/project/app/src/main/assets/book/book.db" | sha256sum -c -
+          grep -F 'versionName = "1.3.9-native"' /tmp/ag/project/app/build.gradle.kts
+
+      - name: Clean book content and verify cleanup
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB=/tmp/ag/project/app/src/main/assets/book/book.db
+          python3 ag-clean-content.py "$DB" /tmp/ag/book-cleanup-audit.json
+          python3 - <<'PY'
+          import sqlite3, json, re
+          db='/tmp/ag/project/app/src/main/assets/book/book.db'
+          con=sqlite3.connect(db)
+          n=con.execute('select count(*) from blocks').fetchone()[0]
+          assert n == 7986, n
+          bad=[]
+          needles=[
+            'исполнительной власти в РФ',
+            'супругов, родителей и детей',
+            'Проверочный расчет прочности и устойчивости',
+            'Понятие и признаки полезной модели',
+            'Эластичность спроса и предложения',
+            'Эффекторные нервные окончания',
+            'или читать все',
+            'Nbsp;',
+          ]
+          for idx,text in con.execute('select block_index,text from blocks'):
+              t=text or ''
+              if any(x in t for x in needles): bad.append((idx,t[:100]))
+          assert not bad, bad[:10]
+          print('Book cleanup PASS:', n, 'blocks')
+          PY
+
+      - name: Apply fast motion patch and verify scope
+        shell: bash
+        run: |
+          set -euo pipefail
+          UI=/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar/ui
+          mkdir -p /tmp/ag/before-ui
+          for f in Navigation.kt Components.kt ReaderScreen.kt FlashcardsScreen.kt; do cp "$UI/$f" "/tmp/ag/before-ui/$f"; done
+          python3 ag-fast-motion.py /tmp/ag/project
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          before=Path('/tmp/ag/before-ui')
+          after=Path('/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar/ui')
+          files=['Navigation.kt','Components.kt','ReaderScreen.kt','FlashcardsScreen.kt']
+          strings=re.compile(r'"(?:\\.|[^"\\])*"',re.S)
+          dims=re.compile(r'(?<![A-Za-z0-9_])\d+(?:\.\d+)?\.(?:dp|sp)\b')
+          for name in files:
+              a=(before/name).read_text(encoding='utf-8')
+              b=(after/name).read_text(encoding='utf-8')
+              assert strings.findall(a)==strings.findall(b), f'text string changed: {name}'
+              assert dims.findall(a)==dims.findall(b), f'dp/sp changed: {name}'
+          print('Scope check PASS: strings and dp/sp unchanged')
+          PY
+
+      - name: Move startup work off UI thread
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ag-startup-performance.py /tmp/ag/project
+          python3 - <<'PY'
+          from pathlib import Path
+          root=Path('/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar')
+          main=(root/'MainActivity.kt').read_text(encoding='utf-8')
+          progress=(root/'data/ProgressStore.kt').read_text(encoding='utf-8')
+          assert 'withContext(Dispatchers.IO)' in main
+          assert 'BookRepository(applicationContext)' in main
+          assert 'val repository = BookRepository(this)' not in main
+          assert 'motion_migration_v10' in progress
+          print('Startup responsiveness verification PASS')
+          PY
+
+      - name: Refresh cleaned book database on installed app
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ag-refresh-book-db.py /tmp/ag/project
+          python3 - <<'PY'
+          from pathlib import Path
+          repo=Path('/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar')
+          book=(repo/'data/BookRepository.kt').read_text(encoding='utf-8')
+          progress=(repo/'data/ProgressStore.kt').read_text(encoding='utf-8')
+          assert 'arabic_grammar_book_v9.db' in book
+          assert 'arabic_grammar_book_v8.db' not in book and 'arabic_grammar_book_v7.db' not in book and 'arabic_grammar_book_v6.db' not in book and 'arabic_grammar_book_v5.db' not in book and 'arabic_grammar_book_v4.db' not in book
+          assert 'arabic_grammar_progress_v4' in progress
+          print('DB refresh migration PASS: book DB bumped, progress store preserved')
+          PY
+
+      - name: Fix mixed-script bracket rendering
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ag-fix-mixed-punctuation.py /tmp/ag/project
+          python3 - <<'PY'
+          from pathlib import Path
+          p=Path('/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar/ui/ReaderScreen.kt')
+          s=p.read_text(encoding='utf-8')
+          assert 'current.text.endsWith("(")' in s
+          assert 'val moved="("+next.text.trimStart()' in s
+          print('Mixed-script renderer verification PASS')
+          PY
+
+      - name: Fix RTL/LTR bracket artifacts in Arabic examples
+        shell: bash
+        run: |
+          set -euo pipefail
+          DB=/tmp/ag/project/app/src/main/assets/book/book.db
+          python3 ag-fix-bidi.py "$DB" /tmp/ag/bidi-fix-audit.json
+          python3 - <<'PY'
+          import sqlite3
+          db='/tmp/ag/project/app/src/main/assets/book/book.db'
+          con=sqlite3.connect(db)
+          checks={
+            467:"ضَرَبَ\nи бить",
+            1778:"كَبُرَ\nу быть большим",
+            7403:"ضَرَبَ\nи бить\nضَارِبٌ\nбьющий",
+            7404:"جَلَسَ\nи сидеть\nجَالِسٌ\nсидящий",
+            7405:"قَرَأَ\nа читать\nقَارِئٌ\nчитающий",
+          }
+          for idx,expected in checks.items():
+              got=con.execute("select text from blocks where block_index=?",(idx,)).fetchone()[0]
+              assert got==expected,(idx,got)
+          print("Bidi example verification PASS")
+          PY
+
+      - name: Fix conjugation trainer table detection
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 ag-fix-conjugation.py /tmp/ag/project
+          python3 - <<'PY'
+          import sqlite3,re
+          db='/tmp/ag/project/app/src/main/assets/book/book.db'
+          con=sqlite3.connect(db)
+          con.row_factory=sqlite3.Row
+          ar=re.compile(r'[\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff]')
+          tables=0
+          forms=0
+          for sec in con.execute("select id from sections where chapter='morphology' and found=1"):
+              rows=con.execute("select text from blocks where section_id=? order by block_index",(sec['id'],)).fetchall()
+              for i,r in enumerate(rows):
+                  lines=[x.strip() for x in (r['text'] or '').splitlines() if x.strip()]
+                  h=' '.join(lines).lower()
+                  if not ('1 лицо' in h and '2 лицо' in h and '3 лицо' in h):
+                      continue
+                  local=0
+                  for rr in rows[i+1:i+5]:
+                      ls=[x.strip() for x in (rr['text'] or '').splitlines() if x.strip()]
+                      low=' '.join(ls).lower()
+                      if not any(k in low for k in ('единств','двойств','множеств')):
+                          break
+                      if len(ls) < 5:
+                          continue
+                      local += sum(1 for x in ls[:5] if ar.search(x) and x.lower()!='нет' and '_' not in x)
+                  if local:
+                      tables += 1
+                      forms += local
+          assert tables >= 100, tables
+          assert forms >= 1500, forms
+          print(f'Conjugation detection PASS: {tables} tables, {forms} usable forms')
+          PY
+
+      - name: Compact settings screen and verify text is unchanged
+        shell: bash
+        run: |
+          set -euo pipefail
+          UI=/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar/ui
+          mkdir -p /tmp/ag/before-settings
+          cp "$UI/SearchSettingsScreens.kt" /tmp/ag/before-settings/SearchSettingsScreens.kt
+          cp "$UI/Components.kt" /tmp/ag/before-settings/Components.kt
+          python3 ag-compact-settings.py /tmp/ag/project
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          before=Path('/tmp/ag/before-settings')
+          after=Path('/tmp/ag/project/app/src/main/java/com/xalidmuslim/arabicgrammar/ui')
+          strings=re.compile(r'"(?:\\.|[^"\\])*"',re.S)
+          for name in ['SearchSettingsScreens.kt','Components.kt']:
+              a=(before/name).read_text(encoding='utf-8')
+              b=(after/name).read_text(encoding='utf-8')
+              assert strings.findall(a)==strings.findall(b), f'text string changed: {name}'
+          print('Compact settings scope PASS: all string literals unchanged')
+          PY
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          packages: platform-tools
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-35" "build-tools;35.0.0" "platform-tools"
+
+      - name: Build APKs
+        working-directory: /tmp/ag/project
+        run: gradle :app:assembleDebug :app:assembleRelease --stacktrace
+
+      - name: Verify build and prepare stable-signing input
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEBUG=/tmp/ag/project/app/build/outputs/apk/debug/app-debug.apk
+          UNSIGNED=/tmp/ag/project/app/build/outputs/apk/release/app-release-unsigned.apk
+          ALIGNED=/tmp/ag/ArabicGrammar-Haibullin-1.3.9-fast-motion-aligned-unsigned.apk
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -v 4 "$DEBUG"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose --print-certs "$DEBUG" | tee /tmp/ag/apk-verification.txt
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -P 16 -f -v 4 "$UNSIGNED" "$ALIGNED"
+          "$ANDROID_HOME/build-tools/35.0.0/zipalign" -c -P 16 -v 4 "$ALIGNED"
+          sha256sum "$DEBUG" "$ALIGNED" | tee -a /tmp/ag/apk-verification.txt
+          sha256sum /tmp/ag/project/app/src/main/assets/book/book.db | tee -a /tmp/ag/apk-verification.txt
+          cp "$ANDROID_HOME/build-tools/35.0.0/lib/apksigner.jar" /tmp/ag/apksigner.jar
+          cp "$ANDROID_HOME/build-tools/35.0.0/zipalign" /tmp/ag/zipalign
+
+      - name: Upload fast motion build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicGrammar-Haibullin-1.3.9-responsive-release-v10
+          path: |
+            /tmp/ag/ArabicGrammar-Haibullin-1.3.9-fast-motion-aligned-unsigned.apk
+            /tmp/ag/project/app/build/outputs/apk/debug/app-debug.apk
+            /tmp/ag/apk-verification.txt
+            /tmp/ag/book-cleanup-audit.json
+            /tmp/ag/bidi-fix-audit.json
+            /tmp/ag/apksigner.jar
+            /tmp/ag/zipalign
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Import verified native project as editable source
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s /tmp/ag/project/app/src/main/assets/book/book.db
+          test -s /tmp/ag/project/app/build/outputs/apk/debug/app-debug.apk
+          test -f /tmp/ag/project/settings.gradle.kts
+          rsync -a --exclude '.git' --exclude '.github' --exclude '.gradle' --exclude '.idea' --exclude 'build' --exclude 'local.properties' --exclude 'signing' --exclude 'development-signing' --exclude '*.keystore' --exclude '*.jks' --exclude '*.p12' --exclude '*.pem' --exclude '*.apk' --exclude '*.aab' /tmp/ag/project/ ../target/
+          cat > ../target/MIGRATION_PROVENANCE.md <<'EOF'
+          # Migration provenance
+          This native Android application is restored from the source archive and patches
+          of `Xalidmuslim/AlFatiha-Native`, branch `arabic-grammar-color-motion-rebuild`,
+          pinned at git commit `d99928a821ff980daebdd92bff7fbe2969002e2c`.
+
+          Original workflow `.github/workflows/build-arabic-grammar-color-motion.yml`
+          verified the original archive SHA-256, content database and all UI patch contracts.
+          This project's exact source and the post-patch database were imported after
+          the successful debug/release Gradle build and APK validation.
+          The old repo and its modules remain unchanged. Signing keys are not imported.
+          EOF
+          cd ../target
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --cached --quiet && { echo "No changes to import"; exit 0; }
+          git diff --cached --name-only | grep -E '^\.github/workflows/' && { echo 'Refusing to update workflow via GITHUB_TOKEN'; exit 1; } || true
+          git commit -m "feat: import verified Arabic Grammar native source and content"
+          git push origin HEAD:main
